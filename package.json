@@ -1,0 +1,17 @@
+{
+  "name": "es6ify",
+  "version": "1.0.0",
+  "description": "Convert ES5 fileset to ES6 with imports and exports",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "acorn": "^8.0.4",
+    "acorn-globals": "^6.0.0",
+    "find-up": "^5.0.0",
+    "yargs": "^16.1.0"
+  }
+}
