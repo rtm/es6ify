@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import {es6ify} from "./index";
 
 const yargs = require("yargs");
@@ -13,6 +15,7 @@ const argv = yargs
   .option("verbose", {alias: "v", describe: "detailed output", type: "boolean"})
   .option("debug", {alias: "d", describe: "very detailed output", type: "boolean"})
   .option("importjs", {describe: "name of file containing re-exports", default: "import.js"})
+  .option("renameDups", {describe: "change duplicated file names", type: "boolean"})
   .option("stripComments", {
     describe: "how to strip comments",
     choices: ["never", "always", "ifneeded"],
@@ -20,6 +23,6 @@ const argv = yargs
   .config(config)
   .help().argv;
 
-const {verbose, stripComments, debug, dest, importjs} = argv;
+const {verbose, stripComments, debug, dest, importjs, indexjs} = argv;
 
-es6ify(argv._[0], {dest, verbose, debug, stripComments, importjs});
+es6ify(argv._[0], {dest, verbose, debug, stripComments, importjs, indexjs});

@@ -21,6 +21,48 @@ async function walkDir(dir, callback, n = 0) {
   }
 }
 
+/**
+ * Generate a list of directory segments.
+ */
+async function* walkDirectories(dir, n = 0) {
+  const files = await fs.readdir(dir);
+
+  for (const f of files) {
+    let dirPath = Path.join(dir, f);
+    let isDirectory = (await fs.stat(dirPath)).isDirectory();
+
+    if (isDirectory) {
+      yield [f, n];
+
+      const generator = walkDirectories(dirPath, n + 1);
+      let result = {done: false};
+
+      while (!result.done) {
+        result = await generator.next();
+        if (result.done) break;
+        yield result.value;
+      }
+    }
+  }
+}
+
+function replaceInSet(set, oldValue, newValue) {
+  if (set.has(oldValue)) {
+    set.delete(oldValue);
+    set.add(newValue);
+    return true;
+  }
+}
+
+function modifyFilename(path, fn) {
+  const elements = Path.parse(path);
+
+  elements.name = fn(elements.name);
+  delete elements.base;
+
+  return Path.format(elements);
+}
+
 // Return the depth of a path. "foo" would be zero. "foo/bar" or "./foo/bar" would be one.
 const depth = path => Path.normalize(path).split(Path.sep).length - 1;
 
@@ -50,23 +92,41 @@ module.exports = async function es6ify(
     maxSize = Infinity,
     stripComments,
     indexjs = "index.js",
+    renameDups = false,
   }
 ) {
-  let symbols = new Map(); // symbols found in all files, and where they were found
+  // Symbols found in all files, where they were defined, assigned, and referenced.
+  let symbols = new Map();
+
+  // All input, split, and merged files, indexed by relative path, with contents.
   let files = new Map(); // all input and/or split files, with their contents
-  let fileCount = 0;
+
+  // Remember all directory and file names (without `.js`), in order to rename if necessary.
+  let fileNames = new Set();
+
+  let dupCount = 0;
 
   if (verbose) console.log("Processing", dir);
 
   await scan();
-  if (verbose) console.log("Found", symbols.size, "symbols in", files.size, "files.");
+
+  if (verbose) {
+    console.log("Found", symbols.size, "symbols in", files.size, "files");
+    if (dupCount) console.info("Renamed", dupCount, "files");
+  }
+  if (debug) console.log("Symbols are", ...symbols.keys());
 
   combine();
 
   if (dest) await write();
 
   async function scan() {
+    // Pre-populate set of file names with directory segments.
+    // It seems that files with the same name as directories can make LWC unhappy.
+    if (renameDups) for await (const [segment] of walkDirectories(dir)) fileNames.add(segment);
+
     await walkFiles();
+
     removeGlobalSymbols();
 
     async function walkFiles() {
@@ -80,6 +140,23 @@ module.exports = async function es6ify(
         let ast;
         const pieces = [];
         const onComment = [];
+        let relativePath = Path.relative(dir, path); // e.g. `src/foobar.js`
+        let fileName = Path.basename(path);
+
+        // If we have already encountered this file name, then rename it.
+        if (fileNames.has(Path.basename(fileName, ".js").toLowerCase()) && renameDups) {
+          const oldRelativePath = relativePath;
+
+          relativePath = modifyFilename(
+            relativePath,
+            fn => fn + String(dupCount++).padStart(3, "0")
+          );
+          fileName = Path.basename(relativePath);
+
+          if (debug) console.info("Renaming duplicate", oldRelativePath, "to", relativePath);
+        }
+
+        fileNames.add(Path.basename(fileName, ".js").toLowerCase());
 
         try {
           ast = Parser.parse(file, {ecmaVersion: 5, allowReturnOutsideFunction: true, onComment});
@@ -113,11 +190,11 @@ module.exports = async function es6ify(
 
         for (let i = 0; i < partitions.length; i++) {
           const partition = partitions[i];
-          const partitionName =
-            partitions.length > 1 ? `${Path.basename(path, ".js")}.${i}.js` : path;
+          const destName =
+            i === 0 ? relativePath : modifyFilename(relativePath, fn => fn + "." + i);
           const code = pieces[i];
-          files.set(partitionName, code);
-          const destName = partitionName.replace(dir, ".");
+
+          files.set(destName, code);
 
           // Find definitions.
           for (let node of partition) {
@@ -145,7 +222,7 @@ module.exports = async function es6ify(
 
             entry[isAssignment ? "assignments" : "references"].add(destName);
 
-            if (debug && isAssignment)
+            if (verbose && isAssignment)
               console.info("Found global assignment to", name, "in", destName);
           }
 
@@ -175,47 +252,82 @@ module.exports = async function es6ify(
     }
 
     function removeGlobalSymbols() {
-      const symbols = [];
+      const removedSymbols = [];
 
-      for (const [symbol, {definition}] of symbols)
+      for (const [symbol, {definition}] of symbols) {
         if (!definition) {
           symbols.delete(symbol);
-          symbols.push(symbol);
+          removedSymbols.push(symbol);
         }
+      }
 
-      if (verbose) console.info("Removed global symbols", ...symbols);
+      if (verbose) console.info("Removed", removedSymbols.length, "global symbols");
+      if (debug) console.info("Removed global symbols were", ...removedSymbols);
     }
   }
 
-  function combine() {}
+  /**
+   * Is a symbol is declared in one file and assigned to in another,
+   * we need to combine those two files.
+   * Hopefully the result will not be too big. If it is, we're screwed.
+   * Currently we do not handle the case where this gives rise to additional mergers!
+   */
+  function combine() {
+    for (const [symbol, {assignments, definition}] of symbols) {
+      // Find other files where this symbol is assigned.
+      const otherFileAssignments = new Set(
+        [...assignments.values()].filter(file => file !== definition)
+      );
+
+      // For each such file, combine it into the file containing the definition.
+      // JavaScript does not allow assignment of imports.
+      for (const otherFile of otherFileAssignments) {
+        if (verbose)
+          console.info("Combining", otherFile, "into", definition, "because of symbol", symbol);
+
+        files.set(definition, files.get(definition) + files.get(otherFile)); // Concatenate the files.
+        files.delete(otherFile); // Forget about this file.
+
+        let replacementCount = 0;
+
+        // Across the entire symbol table,
+        // remap assignments, definitions, and references to the merged file.
+        for (const [_symbol, entry] of symbols) {
+          replaceInSet(entry.assignments, otherFile, definition);
+          if (replaceInSet(entry.references, otherFile, definition)) replacementCount++;
+          if (entry.definition === otherFile) entry.definition = definition;
+        }
+
+        if (debug) console.info("Remapped", replacementCount, "references to combined file");
+      }
+    }
+  }
 
   // Write out the files, with import and export statements, and the import.js file.
   async function write() {
     await fs.rmdir(dest, {recursive: true});
 
     for (let [path, data] of files) {
-      const srcDir = Path.dirname(path);
-      const destDir = srcDir.replace(dir, dest);
-      const destPath = Path.join(destDir, Path.basename(path));
-      const destPathRelative = path.replace(dir, "."); // e.g. `./src/foo.js`
-      const importJsPath = "../".repeat(depth(destPathRelative)) + importjs;
+      const destPath = Path.join(dest, path);
+      const destDir = Path.dirname(destPath);
+      const importJsPath = "../".repeat(depth(path)) + importjs;
 
       // Generate import statements for global symbols used by this file,
       // and export statements for globals it defines.
 
-      // Create import statement for symbols used here, to insert at top of file.
-      const symbolsUsed = symbols
-        .entries()
-        .filter(([symbol, {references}]) => references.has(destPathRelative))
+      // Create import statement for symbols used here and defined elsewhere,
+      // to insert at top of file.
+      const symbolsUsed = [...symbols.entries()]
+        .filter(([symbol, {references, definition}]) => definition !== path && references.has(path))
         .map(([symbol]) => symbol);
       const symbolsUsedImport = symbolsUsed.length
-        ? `import {${symbolsUsed.join(", ")}} from "${importJsPath}";\n\n`
+        ? `import {${symbolsUsed.join(", ")}} from '${importJsPath}';\n\n`
         : "";
 
       // Create export statement for symbols defined here, to insert at bottom of file.
-      const symbolsDefined = Object.keys(symbols).filter(
-        symbol => symbols[symbol].definitions === destPathRelative
-      );
+      const symbolsDefined = [...symbols.entries()]
+        .filter(([symbol, {definition}]) => definition === path)
+        .map(([symbol]) => symbol);
       const symbolsDefinedExport = symbolsDefined.length
         ? `\n\nexport {${symbolsDefined.join(", ")}};\n`
         : "";
@@ -231,23 +343,21 @@ module.exports = async function es6ify(
     await writeIndexJs();
 
     async function writeImportJs() {
-      const importJsPath = Path.join(dir, importjs);
-      const importData = Object.keys(symbols)
-        .map(k => `export {${k}} from "${symbols[k]}";\n`)
+      const importJsPath = Path.join(dest, importjs);
+      const importData = [...symbols.entries()]
+        .map(([symbol, {definition}]) => `export {${symbol}} from './${definition}';\n`)
         .join("");
 
       await fs.writeFile(importJsPath, importData);
+
       if (verbose) console.info("Wrote imports file", importJsPath);
     }
 
     async function writeIndexJs() {
-      const indexJsPath = Path.join(dir, indexjs);
-      const imports = files
-        .keys()
-        .map(file => `import "${file}";\n`)
-        .join("");
+      const indexJsPath = Path.join(dest, indexjs);
+      const imports = [...files.keys()].map(file => `import './${file}';\n`).join("");
 
-      await fs.writeFile(indexJsPath, imports);
+      await fs.writeFile(indexJsPath, "// Automatically generated by es6ify\n\n" + imports);
 
       if (verbose) console.info("Wrote index file", indexJsPath);
     }
