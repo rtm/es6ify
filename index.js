@@ -40,6 +40,23 @@ async function* walkDirectories(dir, n = 0) {
   }
 }
 
+// Given an iterable, and a function to derive a key from each element,
+// group the items by key, and return a map indexed by key containing
+// a set giving the elements for that key.
+function groupBy(iterable, keyFn) {
+  const result = new Map();
+
+  for (const elt of iterable) {
+    const key = keyFn.call(this, elt);
+    let set = result.get(key);
+
+    if (!set) result.set(key, (set = new Set()));
+    set.add(elt);
+  }
+
+  return result;
+}
+
 function replaceInSet(set, oldValue, newValue) {
   if (set.has(oldValue)) {
     set.delete(oldValue);
@@ -82,7 +99,6 @@ module.exports = async function es6ify(
     dest,
     verbose,
     debug,
-    importjs = "import.js",
     maxSize = Infinity,
     stripComments,
     indexjs = "index.js",
@@ -312,19 +328,31 @@ module.exports = async function es6ify(
     for (let [path, data] of files) {
       const destPath = Path.join(dest, path);
       const destDir = Path.dirname(destPath);
-      const importJsPath = "../".repeat(depth(path)) + importjs;
+      const upDir = "../".repeat(depth(path));
 
       // Generate import statements for global symbols used by this file,
       // and export statements for globals it defines.
 
       // Create import statement for symbols used here and defined elsewhere,
       // to insert at top of file.
-      const symbolsUsed = [...symbols.entries()]
-        .filter(([symbol, {references, definition}]) => definition !== path && references.has(path))
-        .map(([symbol]) => symbol);
-      const symbolsUsedImport = symbolsUsed.length
-        ? `import {${symbolsUsed.join(", ")}} from '${importJsPath}';\n\n`
-        : "";
+      const symbolsUsed = [...symbols.entries()].filter(
+        ([symbol, {references, definition}]) => definition !== path && references.has(path)
+      );
+      // Group symbols useed by where they are defined.
+      // `symbolsUsedByDefinition` is a map of definition location to sets of symbol entries.
+      const symbolsUsedByDefinition = groupBy(symbolsUsed, ([, {definition}]) => definition);
+
+      // Create a single import statement for each file in which symbols were defined,
+      // making it slightly easier for a human to view the file.
+      const symbolsUsedImport =
+        Array.from(symbolsUsedByDefinition.entries())
+          .map(
+            ([definition, symbolEntries]) =>
+              `import {${Array.from(symbolEntries)
+                .map(([symbol]) => symbol)
+                .join(", ")}} from '${Path.normalize(Path.join(upDir, definition))}';\n`
+          )
+          .join("") + "\n";
 
       // Create export statement for symbols defined here, to insert at bottom of file.
       const symbolsDefined = [...symbols.entries()]
@@ -341,19 +369,7 @@ module.exports = async function es6ify(
       if (debug) console.info(`Wrote ${destPath}`);
     }
 
-    await writeImportJs();
     await writeIndexJs();
-
-    async function writeImportJs() {
-      const importJsPath = Path.join(dest, importjs);
-      const importData = [...symbols.entries()]
-        .map(([symbol, {definition}]) => `export {${symbol}} from './${definition}';\n`)
-        .join("");
-
-      await fs.writeFile(importJsPath, importData);
-
-      if (verbose) console.info("Wrote imports file", chalk.yellow(importJsPath));
-    }
 
     async function writeIndexJs() {
       const indexJsPath = Path.join(dest, indexjs);
