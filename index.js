@@ -9,7 +9,7 @@ const {Parser} = require("acorn");
 const AcornGlobals = require("acorn-globals");
 const chalk = require("chalk");
 
-// Walk a directory recursively.
+// Walk a directory recursively. Not used at the moment.
 async function walkDir(dir, callback, n = 0) {
   const files = await fs.readdir(dir);
 
@@ -24,6 +24,7 @@ async function walkDir(dir, callback, n = 0) {
 
 /**
  * Generate a list of directory segments.
+ * Not used at the moment.
  */
 async function* walkDirectories(dir, n = 0) {
   const files = await fs.readdir(dir);
@@ -65,6 +66,18 @@ function replaceInSet(set, oldValue, newValue) {
   }
 }
 
+function add(a, b) {
+  return a + b;
+}
+
+function combineInMap(map, firstKey, secondKey, fn) {
+  map.set(firstKey, fn(firstKey, secondKey));
+  map.delete(secondKey);
+}
+
+/**
+ * Change just the filename within a path, leaving the directory and extension unchanged.
+ */
 function modifyFilename(path, fn) {
   const elements = Path.parse(path);
 
@@ -93,10 +106,15 @@ function partitionAt(array, fn) {
   return result;
 }
 
+// Remember all directory and file names (without `.js`), in order to rename if necessary.
+let fileNames = new Set();
+let dupCount = 0;
+
 module.exports = async function es6ify(
-  dir,
+  dir, // root for files to process
+  paths, // individual files to process
+  dest,
   {
-    dest,
     verbose,
     debug,
     maxSize = Infinity,
@@ -104,20 +122,18 @@ module.exports = async function es6ify(
     indexjs = "index.js",
     renameDups = false,
     combine, // combine files containing assignment to import with file where it is declared.
+    filename, // add filename comment to each file. Useful when concatenated.
   }
 ) {
   // Symbols found in all files, where they were defined, assigned, and referenced.
   let symbols = new Map();
 
   // All input, split, and merged files, indexed by relative path, with contents.
-  let files = new Map(); // all input and/or split files, with their contents
+  let files = new Map(); // all input and/or split files.
+  let imports = new Map(); // map of imports (map of files to symbols), indexed by filename.
+  let exports = new Map(); // map of exports (set of symbols), indexed by filename.
 
-  // Remember all directory and file names (without `.js`), in order to rename if necessary.
-  let fileNames = new Set();
-
-  let dupCount = 0;
-
-  if (verbose) console.log("Processing", dir);
+  if (verbose) console.log("Processing", paths.length, "files from", chalk.yellow(dir));
 
   await scan();
 
@@ -129,22 +145,33 @@ module.exports = async function es6ify(
 
   if (combine) combineFiles();
 
+  findCircularities();
+
   if (dest) await write();
 
   async function scan() {
     // Pre-populate set of file names with directory segments.
     // It seems that files with the same name as directories can make LWC unhappy.
-    if (renameDups) for await (const [segment] of walkDirectories(dir)) fileNames.add(segment);
+    paths
+      .map(path =>
+        Path.dirname(path)
+          .split(Path.sep)
+          .filter(Boolean)
+      )
+      .flat()
+      .forEach(seg => fileNames.add(seg));
+
+    if (debug && renameDups) console.debug("directory segments are", fileNames);
 
     await walkFiles();
 
     removeGlobalSymbols();
 
     async function walkFiles() {
-      await walkDir(dir, async function(path) {
-        if (debug) console.log(`Reading ${path}`);
-        await oneFile(path);
-      });
+      for (const path of paths) {
+        if (debug) console.log(`Processing ${path}`);
+        await oneFile(Path.join(dir, path));
+      }
 
       async function oneFile(path) {
         let file = await fs.readFile(path, "utf8");
@@ -292,33 +319,79 @@ module.exports = async function es6ify(
 
       // For each such file, combine it into the file containing the definition.
       // JavaScript does not allow assignment of imports.
-      for (const otherFile of otherFileAssignments) {
-        if (verbose)
-          console.info(
-            "Combining",
-            chalk.yellow(otherFile),
-            "into",
-            chalk.yellow(definition),
-            "because of symbol",
-            chalk.yellow(symbol)
-          );
+      for (const otherFile of otherFileAssignments) combineFileEntries(definition, otherFile);
+    }
+  }
 
-        files.set(definition, files.get(definition) + files.get(otherFile)); // Concatenate the files.
-        files.delete(otherFile); // Forget about this file.
+  /**
+   * Combine two file entries, for whatever reason.
+   * Do all the housekeeping around what symbols are defined and referenced in each file.
+   * Used internally when combining files containing declaration and assignment,
+   * and files referencing each other.
+   */
+  function combineFileEntries(first, second) {
+    if (debug) console.log("Combining", chalk.yellow(second), "into", chalk.yellow(first));
 
-        let replacementCount = 0;
+    files.set(first, files.get(first) + files.get(second)); // Concatenate the files.
+    files.delete(second); // Forget about this file.
 
-        // Across the entire symbol table,
-        // remap assignments, definitions, and references to the merged file.
-        for (const [_symbol, entry] of symbols) {
-          replaceInSet(entry.assignments, otherFile, definition);
-          if (replaceInSet(entry.references, otherFile, definition)) replacementCount++;
-          if (entry.definition === otherFile) entry.definition = definition;
-        }
+    let replacementCount = 0;
 
-        if (debug) console.info("Remapped", replacementCount, "references to combined file");
+    // Across the entire symbol table,
+    // remap assignments, definitions, and references to the merged file.
+    for (const [_symbol, entry] of symbols) {
+      replaceInSet(entry.assignments, second, first);
+      if (replaceInSet(entry.references, second, first)) replacementCount++;
+      if (entry.definition === second) entry.definition = first;
+    }
+
+    if (debug) console.info("Remapped", replacementCount, "references to combined file");
+  }
+
+  /**
+   * For a particular path, identify what symbols it needs to import from where.
+   * Better not to cache or store the results of this, since files might be combined later.
+   *
+   * @returns {Map<file,Set<symbol>>} Map from file to symbols requiring import from that file.
+   */
+  function createImports(path) {
+    // Create import statement for symbols used here and defined elsewhere,
+    // to insert at top of file.
+    const symbolsUsed = [...symbols.entries()].filter(
+      ([symbol, {references, definition}]) => definition !== path && references.has(path)
+    );
+
+    // Group symbols useed by where they are defined.
+    // `symbolsUsedByDefinition` is a map of definition location to sets of symbol entries.
+    return groupBy(symbolsUsed, ([, {definition}]) => definition);
+  }
+
+  /**
+   * Find circularities involving one file importing another file which in turn imports the first one.
+   * Combine them, and hope like hell the result is not too big.
+   */
+  function findCircularities() {
+    let count = 0;
+    const keys = [...files.keys()];
+
+    for (let i = keys.length - 1; i >= 0; i--) {
+      const key = keys[i];
+      const imports = [...createImports(key).keys()];
+
+      for (let j = keys.length - 1; j > i; j--) {
+        const key2 = keys[j];
+        const backImports = [...createImports(key2).keys()];
+
+        if (!imports.includes(key2)) continue; // Is this file imported by the first one?
+        if (!backImports.includes(key)) continue; // Does this file import the first one?
+
+        combineFileEntries(key, key2);
+        count++;
+
+        if (debug) console.info("Combined", key, "with", key2, "to resolve circularity");
       }
     }
+    if (verbose) console.info("Combined", count, "files to resolve circularities");
   }
 
   // Write out the files, with import and export statements, and the import.js file.
@@ -330,22 +403,10 @@ module.exports = async function es6ify(
       const destDir = Path.dirname(destPath);
       const upDir = "../".repeat(depth(path));
 
-      // Generate import statements for global symbols used by this file,
-      // and export statements for globals it defines.
-
-      // Create import statement for symbols used here and defined elsewhere,
-      // to insert at top of file.
-      const symbolsUsed = [...symbols.entries()].filter(
-        ([symbol, {references, definition}]) => definition !== path && references.has(path)
-      );
-      // Group symbols useed by where they are defined.
-      // `symbolsUsedByDefinition` is a map of definition location to sets of symbol entries.
-      const symbolsUsedByDefinition = groupBy(symbolsUsed, ([, {definition}]) => definition);
-
       // Create a single import statement for each file in which symbols were defined,
       // making it slightly easier for a human to view the file.
       const symbolsUsedImport =
-        Array.from(symbolsUsedByDefinition.entries())
+        Array.from(createImports(path).entries())
           .map(
             ([definition, symbolEntries]) =>
               `import {${Array.from(symbolEntries)
@@ -362,7 +423,8 @@ module.exports = async function es6ify(
         ? `\n\nexport {${symbolsDefined.join(", ")}};\n`
         : "";
 
-      const destData = symbolsUsedImport + data + symbolsDefinedExport;
+      const destData =
+        (filename ? filenameComment(path) : "") + symbolsUsedImport + data + symbolsDefinedExport;
 
       await fs.mkdir(destDir, {recursive: true});
       await fs.writeFile(destPath, destData);
@@ -378,6 +440,10 @@ module.exports = async function es6ify(
       await fs.writeFile(indexJsPath, "// Automatically generated by es6ify\n\n" + imports);
 
       if (verbose) console.info("Wrote index file", chalk.yellow(indexJsPath));
+    }
+
+    function filenameComment(path) {
+      return `function ${path.replace(/\W/g, "_")}() { return "This is the path"; }\n`;
     }
   }
 };

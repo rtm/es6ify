@@ -1,13 +1,10 @@
 {
-  "name": "es6ify",
+  "name": "@rtm/es6ify",
   "version": "1.0.0",
   "description": "Convert ES5 fileset to ES6 with imports and exports",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "bin": {
-    "es6ify": "es6ify"
   },
   "author": "",
   "license": "UNLICENSED",
